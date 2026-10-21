@@ -3363,6 +3363,50 @@ class TestMcpToolSearchSettingsEndpoints:
         assert mock_proxy_config["save_call_count"]() == 0
 
 
+class TestMcpToolsListCacheSettingsEndpoints:
+    @staticmethod
+    def _override_auth(role: LitellmUserRoles):
+        from litellm.proxy._types import UserAPIKeyAuth
+        from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
+
+        app.dependency_overrides[user_api_key_auth] = lambda: UserAPIKeyAuth(
+            user_id="u", api_key="hashed", user_role=role
+        )
+
+    def test_get_returns_stored_ttl_and_field_schema(self, mock_proxy_config, mock_auth, monkeypatch):
+        monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", object())
+        mock_proxy_config["config"]["litellm_settings"]["mcp_tools_list_cache_ttl"] = {"ttl_seconds": 45}
+
+        resp = client.get("/get/mcp_tools_list_cache_settings")
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["values"] == {"ttl_seconds": 45.0}
+        assert resp.json()["field_schema"]["properties"]["ttl_seconds"]["type"] == "number"
+
+    def test_update_persists_ttl_in_memory_and_rejects_non_admins(self, mock_proxy_config, monkeypatch):
+        import litellm
+
+        monkeypatch.setattr("litellm.proxy.proxy_server.store_model_in_db", True)
+        monkeypatch.setattr(litellm, "mcp_tools_list_cache_ttl", None)
+        self._override_auth(LitellmUserRoles.PROXY_ADMIN)
+        try:
+            resp = client.patch("/update/mcp_tools_list_cache_settings", json={"ttl_seconds": 45})
+        finally:
+            app.dependency_overrides.clear()
+
+        assert resp.status_code == 200, resp.text
+        assert mock_proxy_config["save_call_count"]() == 1
+        assert litellm.mcp_tools_list_cache_ttl == {"ttl_seconds": 45.0}
+        assert mock_proxy_config["config"]["litellm_settings"]["mcp_tools_list_cache_ttl"] == {"ttl_seconds": 45.0}
+
+        self._override_auth(LitellmUserRoles.INTERNAL_USER)
+        try:
+            denied: Final = client.patch("/update/mcp_tools_list_cache_settings", json={"ttl_seconds": 60})
+        finally:
+            app.dependency_overrides.clear()
+        assert denied.status_code == 403
+
+
 class TestWebSearchInterceptionSettingsEndpoints:
     @staticmethod
     def _override_auth(role: LitellmUserRoles):

@@ -19978,6 +19978,68 @@ class TestToolCatalogGuard:
         proxy_logging_obj.slack_alerting_instance.send_alert.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_cached_tools_are_guarded_on_every_listing(self, catalog_guardrail):
+        import hashlib
+
+        from litellm.proxy._experimental.mcp_server.catalog import _configuration_identity
+        from litellm.proxy._experimental.mcp_server.tools_list_cache import (
+            InProcessToolsListStore,
+            SharedToolsListCache,
+        )
+
+        guardrail, proxy_logging_obj = catalog_guardrail
+        server: Final = MCPServer(
+            server_id="cached-notes",
+            name="cached_notes",
+            url="http://127.0.0.1:8765/mcp",
+            transport=MCPTransport.http,
+        )
+        upstream: Final = MCPTool(
+            name="read_note",
+            description="Read a SECRET note",
+            inputSchema={"type": "object"},
+        )
+
+        class CountingFetch:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def __call__(self) -> ListToolsResult:
+                self.calls += 1
+                return ListToolsResult(tools=[upstream])
+
+        fetch: Final = CountingFetch()
+        store: Final = InProcessToolsListStore(clock=lambda: 100)
+        cache: Final = SharedToolsListCache(
+            store_provider=lambda: store,
+            ttl_seconds=lambda: 60,
+            clock=lambda: 100,
+        )
+        manager: Final = MCPServerManager(
+            tools_list_cache=cache,
+            jwt_signer_provider=lambda: None,
+        )
+        configuration_digest: Final = hashlib.sha256(_configuration_identity(server).encode()).hexdigest()
+
+        primed: Final = await cache.get(server.server_id, configuration_digest, "full", fetch)
+        first: Final = await manager.get_tools_page(
+            server,
+            add_prefix=False,
+            proxy_logging_obj=proxy_logging_obj,
+        )
+        second: Final = await manager.get_tools_page(
+            server,
+            add_prefix=False,
+            proxy_logging_obj=proxy_logging_obj,
+        )
+
+        assert [tool.name for tool in primed.tools] == ["read_note"]
+        assert [(tool.name, tool.description) for tool in first.tools] == [("read_note", "Read a [MASKED] note")]
+        assert [(tool.name, tool.description) for tool in second.tools] == [("read_note", "Read a [MASKED] note")]
+        assert guardrail.seen_texts == [["Read a SECRET note"], ["Read a SECRET note"]]
+        assert fetch.calls == 1
+
+    @pytest.mark.asyncio
     async def test_discovery_masks_nested_schema_descriptions_without_changing_cached_schema(self, catalog_guardrail):
         _, proxy_logging_obj = catalog_guardrail
         upstream: Final = MCPTool(
